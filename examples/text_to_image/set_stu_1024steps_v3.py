@@ -401,11 +401,16 @@ def main():
             os.makedirs(args.output_dir, exist_ok=True)
 
     # Load scheduler, tokenizer and models.
+    #########修改1###################
+    # 每次减少1/2的sampling steps的时候需要手动修改ts(timestep)和ts_tea，在宝可梦数据集上我直接从ts=16，ts_tea=32开始训练的
     ts = 4
     ts_tea = 8
     noise_scheduler = DDIMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
     noise_scheduler.config['prediction_type'] = "v_prediction"
     noise_scheduler.config['num_train_timesteps'] = 1024
+    # 这个修改非常关键，在ts比较小的时候比如ts=4，设置完steps_offset后，noise_scheduler.set_timesteps(ts, device=accelerator.device)之后
+    # timesteps_stu = [1023, 767, 511, 255]如果不设置steps_offset，timesteps_stu = [768, 512, 256, 0]，这样训练和推理时会存在gap
+    # （训练最多带噪声图片是768步噪声，但推理的时候一开始的输入是完全的高斯噪声）
     noise_scheduler.config['steps_offset'] = 1024 // ts - 1
     noise_scheduler = DDIMScheduler.from_config(noise_scheduler.config)
     noise_scheduler_tea = DDIMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
@@ -413,6 +418,7 @@ def main():
     noise_scheduler_tea.config['num_train_timesteps'] = 1024
     noise_scheduler_tea.config['steps_offset'] = 1024 // ts_tea - 1
     noise_scheduler_tea = DDIMScheduler.from_config(noise_scheduler_tea.config)
+    ##################################
     tokenizer = CLIPTokenizer.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="tokenizer", revision=args.revision
     )
@@ -423,15 +429,19 @@ def main():
     unet = UNet2DConditionModel.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="unet", revision=args.non_ema_revision
     )
+    #########修改2###################
     unet_tea = UNet2DConditionModel.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="unet", revision=args.non_ema_revision
     )
+    ##################################
 
     # Freeze vae and text_encoder
     vae.requires_grad_(False)
     text_encoder.requires_grad_(False)
 
+    #########修改3###################
     unet_tea.requires_grad_(False)
+    ##################################
 
     # Create EMA for the unet.
     if args.use_ema:
@@ -670,7 +680,9 @@ def main():
     text_encoder.to(accelerator.device, dtype=weight_dtype)
     vae.to(accelerator.device, dtype=weight_dtype)
 
+    #########修改4###################
     unet_tea.to(accelerator.device, dtype=weight_dtype)
+    ################################
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
@@ -726,14 +738,17 @@ def main():
     progress_bar = tqdm(range(global_step, args.max_train_steps), disable=not accelerator.is_local_main_process)
     progress_bar.set_description("Steps")
 
+    #########修改5：先设置guidance_scale为7.5，采样guidance_scale在V4中实现###################
     guidance_scale = 7.5
     unet_tea.eval()
+    
     
     noise_scheduler.set_timesteps(ts, device=accelerator.device)
     timesteps_stu = noise_scheduler.timesteps
     noise_scheduler_tea.set_timesteps(ts_tea, device=accelerator.device)
     timesteps_tea = noise_scheduler_tea.timesteps
-    print(timesteps_stu, timesteps_tea)
+    print(timesteps_stu, timesteps_tea)  # 如果ts=512，ts_tea=1024，那么timesteps_stu=[1023, 1021, 1019, ..., 1], timesteps_tea=[1023, 1022, 1021, .., 0]
+    ##############################################
     
     for epoch in range(first_epoch, args.num_train_epochs):
         unet.train()
@@ -758,6 +773,7 @@ def main():
                         (latents.shape[0], latents.shape[1], 1, 1), device=latents.device
                     )
 
+                #########修改6###################
                 bsz = latents.shape[0]
                 # Sample a random timestep for each image
                 idx = torch.randint(0, len(timesteps_stu), (bsz,), device=latents.device)
@@ -800,6 +816,7 @@ def main():
                 pred_stu = pred_uncond_stu + guidance_scale * (pred_text_stu - pred_uncond_stu)
                 noisy_latents_stu = noise_scheduler.step_training(pred_stu, timesteps, noisy_latents, eta=0., generator=None).prev_sample
                 
+                ######################################
                 loss = F.mse_loss(noisy_latents_stu.float(), noisy_latents_tea.float(), reduction="mean")
 
                 # Gather the losses across all processes for logging (if we use distributed training).

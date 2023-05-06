@@ -1,19 +1,9 @@
-#!/usr/bin/env python
-# coding=utf-8
-# Copyright 2023 The HuggingFace Inc. team. All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-
-# V4 1. eps prediction 2. guidance strength w is sampled from [w_min, w_max]
+# python -m torch.distributed.launch --nnodes=1 --node_rank=0 --master_addr="127.0.0.1" --nproc_per_node=8 --master_port=29400 
+# ../examples/text_to_image/set_stu_1024steps_v4.py --pretrained_model_name_or_path='lambdalabs/sd-pokemon-diffusers' --dataset_name='lambdalabs/pokemon-blip-captions' 
+# --use_ema --resolution=512 --center_crop --random_flip --train_batch_size=4 --max_train_steps=3000 --learning_rate=1e-05 --max_grad_norm=1 
+# --lr_scheduler="constant_with_warmup" --lr_warmup_steps=1500 --output_dir='eps-4-v4-1500warmup' --checkpointing_steps 50000
+# V4 在v3的基础上做了以下修改
+# 1. eps prediction（为了直接用lambda训出来的ckpt） 2. guidance strength w is sampled from [w_min, w_max]
 
 import argparse
 import logging
