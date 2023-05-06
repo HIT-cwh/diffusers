@@ -45,6 +45,124 @@ from diffusers.optimization import get_scheduler
 from diffusers.utils import check_min_version, is_wandb_available
 from diffusers.utils.import_utils import is_xformers_available
 
+from pycocotools.coco import COCO
+from PIL import Image
+
+
+class CocoDataset(torch.utils.data.Dataset):
+    """COCO Custom Dataset compatible with torch.utils.data.DataLoader."""
+    def __init__(self, root, json, pretrained_model_name_or_path, transform):
+        """Set the path for images, captions and vocabulary wrapper.
+        
+        Args:
+            root: image directory.
+            json: coco annotation file path.
+            vocab: vocabulary wrapper.
+            transform: image transformer.
+        """
+        self.root = root
+        self.coco = COCO(json)
+        self.ids = list(self.coco.anns.keys())
+        self.transform = transform
+        self.tokenizer = CLIPTokenizer.from_pretrained(pretrained_model_name_or_path, subfolder="tokenizer")
+        # self.size = size
+        # self.interpolation = {"linear": PIL.Image.LINEAR,
+        #                       "bilinear": PIL.Image.BILINEAR,
+        #                       "bicubic": PIL.Image.BICUBIC,
+        #                       "lanczos": PIL.Image.LANCZOS,
+        #                       }[interpolation]
+        # self.flip = transforms.RandomHorizontalFlip(p=flip_p)
+
+    def __getitem__(self, index):
+        """Returns one data pair (image and caption)."""
+        coco = self.coco
+        # vocab = self.vocab
+        ann_id = self.ids[index]
+        caption = coco.anns[ann_id]['caption']
+        img_id = coco.anns[ann_id]['image_id']
+        path = coco.loadImgs(img_id)[0]['file_name']
+
+        image = Image.open(os.path.join(self.root, path)).convert('RGB')
+        ############ transform
+        # image = np.array(image).astype(np.uint8)
+        # crop = min(image.shape[0], image.shape[1])
+        # h, w, = image.shape[0], image.shape[1]
+        # image = image[(h - crop) // 2:(h + crop) // 2,
+        #       (w - crop) // 2:(w + crop) // 2]
+        # image = Image.fromarray(image)
+        # image = image.resize((self.size, self.size), resample=self.interpolation)
+        if self.transform is not None:
+            image = self.transform(image)
+
+        # Convert caption (string) to word ids.
+        inputs = self.tokenizer(
+            caption, max_length=self.tokenizer.model_max_length, padding="max_length", truncation=True, return_tensors="pt"
+        )
+        # tokens = nltk.tokenize.word_tokenize(str(caption).lower())
+        # caption = []
+        # caption.append(vocab('<start>'))
+        # caption.extend([vocab(token) for token in tokens])
+        # caption.append(vocab('<end>'))
+        # target = torch.Tensor(caption)
+        return image, inputs.input_ids
+
+    def __len__(self):
+        return len(self.ids)
+
+
+def collate_fn(data):
+    """Creates mini-batch tensors from the list of tuples (image, caption).
+    
+    We should build custom collate_fn rather than using default collate_fn, 
+    because merging caption (including padding) is not supported in default.
+
+    Args:
+        data: list of tuple (image, caption). 
+            - image: torch tensor of shape (3, 256, 256).
+            - caption: torch tensor of shape (?); variable length.
+
+    Returns:
+        images: torch tensor of shape (batch_size, 3, 256, 256).
+        targets: torch tensor of shape (batch_size, padded_length).
+        lengths: list; valid length for each padded caption.
+    """
+    # Sort a data list by caption length (descending order).
+    data.sort(key=lambda x: len(x[1]), reverse=True)
+    images, input_ids = zip(*data)
+
+    # Merge images (from tuple of 3D tensor to 4D tensor).
+    images = torch.stack(images, 0)
+
+    # Merge captions (from tuple of 1D tensor to 2D tensor).
+    input_ids = torch.stack(input_ids, 0)
+    input_ids = input_ids.squeeze(1)
+    # lengths = [len(cap) for cap in captions]
+    # targets = torch.zeros(len(captions), max(lengths)).long()
+    # for i, cap in enumerate(captions):
+    #     end = lengths[i]
+    #     targets[i, :end] = cap[:end]        
+    return images, input_ids
+
+def get_loader(root, json, transform, batch_size, shuffle, num_workers, pretrained_model_name_or_path):
+    """Returns torch.utils.data.DataLoader for custom coco dataset."""
+    # COCO caption dataset
+    coco = CocoDataset(root=root,
+                       json=json,
+                       transform=transform, 
+                       pretrained_model_name_or_path=pretrained_model_name_or_path)
+    
+    # Data loader for COCO dataset
+    # This will return (images, captions, lengths) for each iteration.
+    # images: a tensor of shape (batch_size, 3, 224, 224).
+    # captions: a tensor of shape (batch_size, padded_length).
+    # lengths: a list indicating valid length for each caption. length is (batch_size).
+    data_loader = torch.utils.data.DataLoader(dataset=coco, 
+                                              batch_size=batch_size,
+                                              shuffle=shuffle,
+                                              num_workers=num_workers,
+                                              collate_fn=collate_fn)
+    return data_loader
+
 
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
 check_min_version("0.17.0.dev0")
@@ -404,9 +522,9 @@ def main():
     noise_scheduler.config['num_train_timesteps'] = 1024
     noise_scheduler.config['steps_offset'] = 0
     noise_scheduler = DDIMScheduler.from_config(noise_scheduler.config)
-    tokenizer = CLIPTokenizer.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="tokenizer", revision=args.revision
-    )
+    # tokenizer = CLIPTokenizer.from_pretrained(
+    #     args.pretrained_model_name_or_path, subfolder="tokenizer", revision=args.revision
+    # )
     text_encoder = CLIPTextModel.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="text_encoder", revision=args.revision
     )
@@ -512,106 +630,15 @@ def main():
     # Get the datasets: you can either provide your own training and evaluation files (see below)
     # or specify a Dataset from the hub (the dataset will be downloaded automatically from the datasets Hub).
 
-    # In distributed training, the load_dataset function guarantees that only one local process can concurrently
-    # download the dataset.
-    if args.dataset_name is not None:
-        # Downloading and loading a dataset from the hub.
-        dataset = load_dataset(
-            args.dataset_name,
-            args.dataset_config_name,
-            cache_dir=args.cache_dir,
-        )
-    else:
-        data_files = {}
-        if args.train_data_dir is not None:
-            data_files["train"] = os.path.join(args.train_data_dir, "**")
-        dataset = load_dataset(
-            "imagefolder",
-            data_files=data_files,
-            cache_dir=args.cache_dir,
-        )
-        # See more about loading custom images at
-        # https://huggingface.co/docs/datasets/v2.4.0/en/image_load#imagefolder
-
-    # Preprocessing the datasets.
-    # We need to tokenize inputs and targets.
-    column_names = dataset["train"].column_names
-
-    # 6. Get the column names for input/target.
-    dataset_columns = DATASET_NAME_MAPPING.get(args.dataset_name, None)
-    if args.image_column is None:
-        image_column = dataset_columns[0] if dataset_columns is not None else column_names[0]
-    else:
-        image_column = args.image_column
-        if image_column not in column_names:
-            raise ValueError(
-                f"--image_column' value '{args.image_column}' needs to be one of: {', '.join(column_names)}"
-            )
-    if args.caption_column is None:
-        caption_column = dataset_columns[1] if dataset_columns is not None else column_names[1]
-    else:
-        caption_column = args.caption_column
-        if caption_column not in column_names:
-            raise ValueError(
-                f"--caption_column' value '{args.caption_column}' needs to be one of: {', '.join(column_names)}"
-            )
-
-    # Preprocessing the datasets.
-    # We need to tokenize input captions and transform the images.
-    def tokenize_captions(examples, is_train=True):
-        captions = []
-        for caption in examples[caption_column]:
-            if isinstance(caption, str):
-                captions.append(caption)
-            elif isinstance(caption, (list, np.ndarray)):
-                # take a random caption if there are multiple
-                captions.append(random.choice(caption) if is_train else caption[0])
-            else:
-                raise ValueError(
-                    f"Caption column `{caption_column}` should contain either strings or lists of strings."
-                )
-        inputs = tokenizer(
-            captions, max_length=tokenizer.model_max_length, padding="max_length", truncation=True, return_tensors="pt"
-        )
-        return inputs.input_ids
-
-    # Preprocessing the datasets.
-    train_transforms = transforms.Compose(
-        [
-            transforms.Resize(args.resolution, interpolation=transforms.InterpolationMode.BILINEAR),
-            transforms.CenterCrop(args.resolution) if args.center_crop else transforms.RandomCrop(args.resolution),
-            transforms.RandomHorizontalFlip() if args.random_flip else transforms.Lambda(lambda x: x),
-            transforms.ToTensor(),
-            transforms.Normalize([0.5], [0.5]),
-        ]
-    )
-
-    def preprocess_train(examples):
-        images = [image.convert("RGB") for image in examples[image_column]]
-        examples["pixel_values"] = [train_transforms(image) for image in images]
-        examples["input_ids"] = tokenize_captions(examples)
-        return examples
-
-    with accelerator.main_process_first():
-        if args.max_train_samples is not None:
-            dataset["train"] = dataset["train"].shuffle(seed=args.seed).select(range(args.max_train_samples))
-        # Set the training transforms
-        train_dataset = dataset["train"].with_transform(preprocess_train)
-
-    def collate_fn(examples):
-        pixel_values = torch.stack([example["pixel_values"] for example in examples])
-        pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
-        input_ids = torch.stack([example["input_ids"] for example in examples])
-        return {"pixel_values": pixel_values, "input_ids": input_ids}
-
-    # DataLoaders creation:
-    train_dataloader = torch.utils.data.DataLoader(
-        train_dataset,
-        shuffle=True,
-        collate_fn=collate_fn,
-        batch_size=args.train_batch_size,
-        num_workers=args.dataloader_num_workers,
-    )
+    transform = transforms.Compose([ 
+        transforms.RandomResizedCrop(args.resolution, scale=(0.9, 1.0), interpolation=transforms.InterpolationMode.BICUBIC),
+        transforms.RandomHorizontalFlip(), 
+        transforms.ToTensor(), 
+        transforms.Normalize((0.485, 0.456, 0.406), 
+                             (0.229, 0.224, 0.225))])
+    train_dataloader = get_loader('/nvme/dataset/coco/train2017', '/nvme/dataset/coco/annotations/captions_train2017.json', 
+                                  transform=transform, batch_size=args.train_batch_size, 
+                                  shuffle=True, num_workers=args.dataloader_num_workers, pretrained_model_name_or_path=args.pretrained_model_name_or_path)
 
     # Scheduler and math around the number of training steps.
     overrode_max_train_steps = False
@@ -648,7 +675,7 @@ def main():
     total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
 
     logger.info("***** Running training *****")
-    logger.info(f"  Num examples = {len(train_dataset)}")
+    logger.info(f"  Num examples = {len(train_dataloader.dataset)}")
     logger.info(f"  Num Epochs = {args.num_train_epochs}")
     logger.info(f"  Instantaneous batch size per device = {args.train_batch_size}")
     logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
@@ -691,6 +718,7 @@ def main():
         train_loss = 0.0
         for step, batch in enumerate(train_dataloader):
             # Skip steps until we reach the resumed step
+            images, input_ids = batch
             if args.resume_from_checkpoint and epoch == first_epoch and step < resume_step:
                 if step % args.gradient_accumulation_steps == 0:
                     progress_bar.update(1)
@@ -698,7 +726,7 @@ def main():
 
             with accelerator.accumulate(unet):
                 # Convert images to latent space
-                latents = vae.encode(batch["pixel_values"].to(dtype=weight_dtype)).latent_dist.sample()
+                latents = vae.encode(images.to(dtype=weight_dtype)).latent_dist.sample()
                 latents = latents * vae.config.scaling_factor
 
                 # Sample noise that we'll add to the latents
@@ -719,7 +747,7 @@ def main():
                 noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
                 # Get the text embedding for conditioning
-                encoder_hidden_states = text_encoder(batch["input_ids"])[0]
+                encoder_hidden_states = text_encoder(input_ids)[0]
 
                 # Get the target for loss depending on the prediction type
                 if noise_scheduler.config.prediction_type == "epsilon":
