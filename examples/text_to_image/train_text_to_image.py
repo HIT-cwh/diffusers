@@ -1,17 +1,11 @@
-#!/usr/bin/env python
-# coding=utf-8
-# Copyright 2023 The HuggingFace Inc. team. All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
+"""起实验命令
+python -m torch.distributed.launch --nnodes=1 --node_rank=0 --master_addr="127.0.0.1" --nproc_per_node=8 --master_port=29400
+../examples/text_to_image/train_text_to_image.py --pretrained_model_name_or_path='CompVis/stable-diffusion-v1-4' --dataset_name='lambdalabs/pokemon-blip-captions'
+--use_ema --resolution=512 --center_crop --random_flip --train_batch_size=4 --max_train_steps=15000 --learning_rate=1e-05 --max_grad_norm=1
+--lr_scheduler="constant" --lr_warmup_steps=0 --output_dir='pokemon_v_1024' --checkpointing_steps 50000 --report_to wandb
+
+pretrained ckpt path: /mnt/petrelfs/share_data/caoweihan.p/sd-pokemon-model-v-1024-fix
+"""
 
 import argparse
 import logging
@@ -38,7 +32,7 @@ from tqdm.auto import tqdm
 from transformers import CLIPTextModel, CLIPTokenizer
 
 import diffusers
-from diffusers import AutoencoderKL, DDPMScheduler, StableDiffusionPipeline, UNet2DConditionModel
+from diffusers import AutoencoderKL, DDPMScheduler, StableDiffusionPipeline, UNet2DConditionModel, DDIMScheduler
 from diffusers.optimization import get_scheduler
 from diffusers.training_utils import EMAModel
 from diffusers.utils import check_min_version, deprecate, is_wandb_available
@@ -59,7 +53,7 @@ DATASET_NAME_MAPPING = {
 }
 
 
-def log_validation(vae, text_encoder, tokenizer, unet, args, accelerator, weight_dtype, epoch):
+def log_validation(vae, text_encoder, tokenizer, unet, args, accelerator, weight_dtype, epoch, model_type='v_prediction'):
     logger.info("Running validation... ")
 
     pipeline = StableDiffusionPipeline.from_pretrained(
@@ -72,6 +66,12 @@ def log_validation(vae, text_encoder, tokenizer, unet, args, accelerator, weight
         revision=args.revision,
         torch_dtype=weight_dtype,
     )
+    if model_type == 'v_prediction':
+        pipeline.scheduler.config['prediction_type'] = "v_prediction"
+        pipeline.scheduler.config['num_train_timesteps'] = 1024
+        pipeline.scheduler.config['steps_offset'] = 0
+        pipeline.scheduler = DDIMScheduler.from_config(
+            pipeline.scheduler.config)
     pipeline = pipeline.to(accelerator.device)
     pipeline.set_progress_bar_config(disable=True)
 
@@ -385,6 +385,11 @@ def parse_args():
             " more information see https://huggingface.co/docs/accelerate/v0.17.0/en/package_reference/accelerator#accelerate.Accelerator"
         ),
     )
+    parser.add_argument(
+        "--caption_drop_prob",
+        type=float,
+        default=0.,
+    )
 
     args = parser.parse_args()
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
@@ -457,7 +462,13 @@ def main():
             ).repo_id
 
     # Load scheduler, tokenizer and models.
-    noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
+    # noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
+    noise_scheduler = DDIMScheduler.from_pretrained(
+        args.pretrained_model_name_or_path, subfolder="scheduler")
+    noise_scheduler.config['prediction_type'] = "v_prediction"
+    noise_scheduler.config['num_train_timesteps'] = 1024
+    noise_scheduler.config['steps_offset'] = 0
+    noise_scheduler = DDIMScheduler.from_config(noise_scheduler.config)
     tokenizer = CLIPTokenizer.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="tokenizer", revision=args.revision
     )
@@ -638,6 +649,8 @@ def main():
         captions = []
         for caption in examples[caption_column]:
             if isinstance(caption, str):
+                if torch.rand(1) < args.caption_drop_prob:
+                    caption = ''
                 captions.append(caption)
             elif isinstance(caption, (list, np.ndarray)):
                 # take a random caption if there are multiple
@@ -747,6 +760,7 @@ def main():
     logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
     logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
     logger.info(f"  Total optimization steps = {args.max_train_steps}")
+    logger.info(f"  Drop rate = {args.caption_drop_prob}")
     global_step = 0
     first_epoch = 0
 
@@ -890,6 +904,7 @@ def main():
                     accelerator,
                     weight_dtype,
                     global_step,
+                    model_type=noise_scheduler.config['prediction_type']
                 )
                 if args.use_ema:
                     # Switch back to the original UNet parameters.
