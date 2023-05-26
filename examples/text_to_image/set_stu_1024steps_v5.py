@@ -1,7 +1,8 @@
-"""起实验命令
-在.../diffusers/src目录下
+"""
+与v3相比支持随机选择classifier free guidance strength进行训练，候选范围为[1, 14]
+起实验命令，在.../diffusers/src目录下：
 python -m torch.distributed.launch --nnodes=1 --node_rank=0 --master_addr="127.0.0.1" --nproc_per_node=8 --master_port=29400
-../examples/text_to_image/set_stu_1024steps_v3.py --pretrained_model_name_or_path='/mnt/petrelfs/share_data/caoweihan.p/sd-pokemon-model-v-1024-fix'
+../examples/text_to_image/set_stu_1024steps_v5.py --pretrained_model_name_or_path='/mnt/petrelfs/share_data/caoweihan.p/sd-pokemon-model-v-1024-fix'
 --dataset_name='lambdalabs/pokemon-blip-captions'
 --use_ema --resolution=512 --center_crop --random_flip --train_batch_size=4 --max_train_steps=1000 --learning_rate=1e-05 --max_grad_norm=1
 --lr_scheduler="constant" --lr_warmup_steps=0 --output_dir='distill_16steps' --checkpointing_steps 50000 --report_to wandb
@@ -9,7 +10,6 @@ python -m torch.distributed.launch --nnodes=1 --node_rank=0 --master_addr="127.0
 每次训练结束需要修改pretrained_model_name_or_path为上次训练保存ckpt的路径（如distill_16steps），
 修改ts为上次训练的一半，并适当增加训练iters，即max_train_steps
 
-pretrained ckpt path: /mnt/petrelfs/share_data/caoweihan.p/v-4-v3
 """
 
 import argparse
@@ -18,9 +18,7 @@ import math
 import os
 import random
 from pathlib import Path
-from typing import Optional
 import copy
-import random
 
 import accelerate
 import datasets
@@ -33,28 +31,105 @@ from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import ProjectConfiguration, set_seed
 from datasets import load_dataset
-from huggingface_hub import HfFolder, Repository, create_repo, whoami
+from huggingface_hub import create_repo, upload_folder
 from packaging import version
 from torchvision import transforms
 from tqdm.auto import tqdm
 from transformers import CLIPTextModel, CLIPTokenizer
 
 import diffusers
-from diffusers import AutoencoderKL, DDPMScheduler, StableDiffusionPipeline, UNet2DConditionModel, PNDMScheduler, DDIMScheduler
+from diffusers import AutoencoderKL, DDPMScheduler, StableDiffusionPipeline, \
+    UNet2DConditionModel, DDIMScheduler
 from diffusers.optimization import get_scheduler
 from diffusers.training_utils import EMAModel
-from diffusers.utils import check_min_version, deprecate
+from diffusers.utils import check_min_version, deprecate, is_wandb_available
 from diffusers.utils.import_utils import is_xformers_available
 
+if is_wandb_available():
+    import wandb
 
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
-check_min_version("0.15.0.dev0")
+check_min_version("0.17.0.dev0")
 
 logger = get_logger(__name__, log_level="INFO")
 
+DATASET_NAME_MAPPING = {
+    "lambdalabs/pokemon-blip-captions": ("image", "text"),
+}
+
+
+def log_validation(vae, text_encoder, tokenizer, unet, args, accelerator,
+                   weight_dtype, epoch, num_inference_steps,
+                   model_type='v_prediction'):
+    logger.info("Running validation... ")
+
+    pipeline = StableDiffusionPipeline.from_pretrained(
+        args.pretrained_model_name_or_path,
+        vae=accelerator.unwrap_model(vae),
+        text_encoder=accelerator.unwrap_model(text_encoder),
+        tokenizer=tokenizer,
+        unet=accelerator.unwrap_model(unet),
+        safety_checker=None,
+        revision=args.revision,
+        torch_dtype=weight_dtype,
+    )
+    if model_type == 'v_prediction':
+        pipeline.scheduler.config['prediction_type'] = "v_prediction"
+        pipeline.scheduler.config['num_train_timesteps'] = 1024
+        pipeline.scheduler.config[
+            'steps_offset'] = 1024 // num_inference_steps - 1
+        pipeline.scheduler = DDIMScheduler.from_config(
+            pipeline.scheduler.config)
+    pipeline = pipeline.to(accelerator.device)
+    pipeline.set_progress_bar_config(disable=True)
+
+    if args.enable_xformers_memory_efficient_attention:
+        pipeline.enable_xformers_memory_efficient_attention()
+
+    if args.seed is None:
+        generator = None
+    else:
+        generator = torch.Generator(device=accelerator.device).manual_seed(
+            args.seed)
+
+    images = []
+    for i in range(len(args.validation_prompts)):
+        with torch.autocast("cuda"):
+            image = pipeline(args.validation_prompts[i],
+                             num_inference_steps=num_inference_steps,
+                             generator=generator).images[0]
+
+        images.append(image)
+
+    for tracker in accelerator.trackers:
+        if tracker.name == "tensorboard":
+            np_images = np.stack([np.asarray(img) for img in images])
+            tracker.writer.add_images("validation", np_images, epoch,
+                                      dataformats="NHWC")
+        elif tracker.name == "wandb":
+            tracker.log(
+                {
+                    "validation": [
+                        wandb.Image(image,
+                                    caption=f"{i}: {args.validation_prompts[i]}")
+                        for i, image in enumerate(images)
+                    ]
+                }
+            )
+        else:
+            logger.warn(f"image logging not implemented for {tracker.name}")
+
+    del pipeline
+    torch.cuda.empty_cache()
+
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Simple example of a training script.")
+    parser = argparse.ArgumentParser(
+        description="Simple example of a training script.")
+    parser.add_argument(
+        "--input_pertubation", type=float, default=0,
+        help="The scale of input pretubation. Recommended 0.1."
+    )
     parser.add_argument(
         "--pretrained_model_name_or_path",
         type=str,
@@ -96,7 +171,8 @@ def parse_args():
         ),
     )
     parser.add_argument(
-        "--image_column", type=str, default="image", help="The column of the dataset containing an image."
+        "--image_column", type=str, default="image",
+        help="The column of the dataset containing an image."
     )
     parser.add_argument(
         "--caption_column",
@@ -114,6 +190,14 @@ def parse_args():
         ),
     )
     parser.add_argument(
+        "--validation_prompts",
+        type=str,
+        default=None,
+        nargs="+",
+        help=(
+            "A set of prompts evaluated every `--validation_epochs` and logged to `--report_to`."),
+    )
+    parser.add_argument(
         "--output_dir",
         type=str,
         default="sd-model-finetuned",
@@ -125,7 +209,8 @@ def parse_args():
         default=None,
         help="The directory where the downloaded models and datasets will be stored.",
     )
-    parser.add_argument("--seed", type=int, default=None, help="A seed for reproducible training.")
+    parser.add_argument("--seed", type=int, default=None,
+                        help="A seed for reproducible training.")
     parser.add_argument(
         "--resolution",
         type=int,
@@ -150,7 +235,8 @@ def parse_args():
         help="whether to randomly flip images horizontally",
     )
     parser.add_argument(
-        "--train_batch_size", type=int, default=16, help="Batch size (per device) for the training dataloader."
+        "--train_batch_size", type=int, default=16,
+        help="Batch size (per device) for the training dataloader."
     )
     parser.add_argument("--num_train_epochs", type=int, default=100)
     parser.add_argument(
@@ -192,10 +278,19 @@ def parse_args():
         ),
     )
     parser.add_argument(
-        "--lr_warmup_steps", type=int, default=500, help="Number of steps for the warmup in the lr scheduler."
+        "--lr_warmup_steps", type=int, default=500,
+        help="Number of steps for the warmup in the lr scheduler."
     )
     parser.add_argument(
-        "--use_8bit_adam", action="store_true", help="Whether or not to use 8-bit Adam from bitsandbytes."
+        "--snr_gamma",
+        type=float,
+        default=None,
+        help="SNR weighting gamma to be used if rebalancing the loss. Recommended value is 5.0. "
+             "More details here: https://arxiv.org/abs/2303.09556.",
+    )
+    parser.add_argument(
+        "--use_8bit_adam", action="store_true",
+        help="Whether or not to use 8-bit Adam from bitsandbytes."
     )
     parser.add_argument(
         "--allow_tf32",
@@ -205,7 +300,8 @@ def parse_args():
             " https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices"
         ),
     )
-    parser.add_argument("--use_ema", action="store_true", help="Whether to use EMA model.")
+    parser.add_argument("--use_ema", action="store_true",
+                        help="Whether to use EMA model.")
     parser.add_argument(
         "--non_ema_revision",
         type=str,
@@ -224,13 +320,20 @@ def parse_args():
             "Number of subprocesses to use for data loading. 0 means that the data will be loaded in the main process."
         ),
     )
-    parser.add_argument("--adam_beta1", type=float, default=0.9, help="The beta1 parameter for the Adam optimizer.")
-    parser.add_argument("--adam_beta2", type=float, default=0.999, help="The beta2 parameter for the Adam optimizer.")
-    parser.add_argument("--adam_weight_decay", type=float, default=1e-2, help="Weight decay to use.")
-    parser.add_argument("--adam_epsilon", type=float, default=1e-08, help="Epsilon value for the Adam optimizer")
-    parser.add_argument("--max_grad_norm", default=1.0, type=float, help="Max gradient norm.")
-    parser.add_argument("--push_to_hub", action="store_true", help="Whether or not to push the model to the Hub.")
-    parser.add_argument("--hub_token", type=str, default=None, help="The token to use to push to the Model Hub.")
+    parser.add_argument("--adam_beta1", type=float, default=0.9,
+                        help="The beta1 parameter for the Adam optimizer.")
+    parser.add_argument("--adam_beta2", type=float, default=0.999,
+                        help="The beta2 parameter for the Adam optimizer.")
+    parser.add_argument("--adam_weight_decay", type=float, default=1e-2,
+                        help="Weight decay to use.")
+    parser.add_argument("--adam_epsilon", type=float, default=1e-08,
+                        help="Epsilon value for the Adam optimizer")
+    parser.add_argument("--max_grad_norm", default=1.0, type=float,
+                        help="Max gradient norm.")
+    parser.add_argument("--push_to_hub", action="store_true",
+                        help="Whether or not to push the model to the Hub.")
+    parser.add_argument("--hub_token", type=str, default=None,
+                        help="The token to use to push to the Model Hub.")
     parser.add_argument(
         "--hub_model_id",
         type=str,
@@ -266,7 +369,8 @@ def parse_args():
             ' (default), `"wandb"` and `"comet_ml"`. Use `"all"` to report to all integrations.'
         ),
     )
-    parser.add_argument("--local_rank", type=int, default=-1, help="For distributed training: local_rank")
+    parser.add_argument("--local_rank", type=int, default=-1,
+                        help="For distributed training: local_rank")
     parser.add_argument(
         "--checkpointing_steps",
         type=int,
@@ -296,11 +400,36 @@ def parse_args():
         ),
     )
     parser.add_argument(
-        "--enable_xformers_memory_efficient_attention", action="store_true", help="Whether or not to use xformers."
+        "--enable_xformers_memory_efficient_attention", action="store_true",
+        help="Whether or not to use xformers."
     )
-    parser.add_argument("--noise_offset", type=float, default=0, help="The scale of noise offset.")
-    parser.add_argument("--ts", type=int, default=4,
-                        help="Sampling steps of the student model.")
+    parser.add_argument("--noise_offset", type=float, default=0,
+                        help="The scale of noise offset.")
+    parser.add_argument(
+        "--validation_epochs",
+        type=int,
+        default=5,
+        help="Run validation every X epochs.",
+    )
+    parser.add_argument(
+        "--tracker_project_name",
+        type=str,
+        default="text2image-fine-tune",
+        help=(
+            "The `project_name` argument passed to Accelerator.init_trackers for"
+            " more information see https://huggingface.co/docs/accelerate/v0.17.0/en/package_reference/accelerator#accelerate.Accelerator"
+        ),
+    )
+    parser.add_argument(
+        "--caption_drop_prob",
+        type=float,
+        default=0.,
+    )
+    parser.add_argument(
+        "--ts",
+        type=int,
+        default=16,
+    )
 
     args = parser.parse_args()
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
@@ -318,21 +447,6 @@ def parse_args():
     return args
 
 
-def get_full_repo_name(model_id: str, organization: Optional[str] = None, token: Optional[str] = None):
-    if token is None:
-        token = HfFolder.get_token()
-    if organization is None:
-        username = whoami(token)["name"]
-        return f"{username}/{model_id}"
-    else:
-        return f"{organization}/{model_id}"
-
-
-dataset_name_mapping = {
-    "lambdalabs/pokemon-blip-captions": ("image", "text"),
-}
-
-
 def main():
     args = parse_args()
 
@@ -347,7 +461,8 @@ def main():
         )
     logging_dir = os.path.join(args.output_dir, args.logging_dir)
 
-    accelerator_project_config = ProjectConfiguration(total_limit=args.checkpoints_total_limit)
+    accelerator_project_config = ProjectConfiguration(
+        total_limit=args.checkpoints_total_limit)
 
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
@@ -379,71 +494,67 @@ def main():
 
     # Handle the repository creation
     if accelerator.is_main_process:
-        if args.push_to_hub:
-            if args.hub_model_id is None:
-                repo_name = get_full_repo_name(Path(args.output_dir).name, token=args.hub_token)
-            else:
-                repo_name = args.hub_model_id
-            create_repo(repo_name, exist_ok=True, token=args.hub_token)
-            repo = Repository(args.output_dir, clone_from=repo_name, token=args.hub_token)
-
-            with open(os.path.join(args.output_dir, ".gitignore"), "w+") as gitignore:
-                if "step_*" not in gitignore:
-                    gitignore.write("step_*\n")
-                if "epoch_*" not in gitignore:
-                    gitignore.write("epoch_*\n")
-        elif args.output_dir is not None:
+        if args.output_dir is not None:
             os.makedirs(args.output_dir, exist_ok=True)
 
+        if args.push_to_hub:
+            repo_id = create_repo(
+                repo_id=args.hub_model_id or Path(args.output_dir).name,
+                exist_ok=True, token=args.hub_token
+            ).repo_id
+
     # Load scheduler, tokenizer and models.
-    #########修改1###################
-    # 每次减少1/2的sampling steps的时候需要手动修改ts(timestep)和ts_tea，在宝可梦数据集上我直接从ts=16，ts_tea=32开始训练的
+    # noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
     ts = args.ts
     ts_tea = ts * 2
-    noise_scheduler = DDIMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
+    noise_scheduler = DDIMScheduler.from_pretrained(
+        args.pretrained_model_name_or_path, subfolder="scheduler")
     noise_scheduler.config['prediction_type'] = "v_prediction"
     noise_scheduler.config['num_train_timesteps'] = 1024
-    # 这个修改非常关键，在ts比较小的时候比如ts=4，设置完steps_offset后，noise_scheduler.set_timesteps(ts, device=accelerator.device)之后
-    # timesteps_stu = [1023, 767, 511, 255]如果不设置steps_offset，timesteps_stu = [768, 512, 256, 0]，这样训练和推理时会存在gap
-    # （训练最多带噪声图片是768步噪声，但推理的时候一开始的输入是完全的高斯噪声）
     noise_scheduler.config['steps_offset'] = 1024 // ts - 1
     noise_scheduler = DDIMScheduler.from_config(noise_scheduler.config)
-    noise_scheduler_tea = DDIMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
+    noise_scheduler_tea = DDIMScheduler.from_pretrained(
+        args.pretrained_model_name_or_path, subfolder="scheduler")
     noise_scheduler_tea.config['prediction_type'] = "v_prediction"
     noise_scheduler_tea.config['num_train_timesteps'] = 1024
     noise_scheduler_tea.config['steps_offset'] = 1024 // ts_tea - 1
     noise_scheduler_tea = DDIMScheduler.from_config(noise_scheduler_tea.config)
-    ##################################
+
     tokenizer = CLIPTokenizer.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="tokenizer", revision=args.revision
+        args.pretrained_model_name_or_path, subfolder="tokenizer",
+        revision=args.revision
     )
     text_encoder = CLIPTextModel.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="text_encoder", revision=args.revision
+        args.pretrained_model_name_or_path, subfolder="text_encoder",
+        revision=args.revision
     )
-    vae = AutoencoderKL.from_pretrained(args.pretrained_model_name_or_path, subfolder="vae", revision=args.revision)
+    vae = AutoencoderKL.from_pretrained(args.pretrained_model_name_or_path,
+                                        subfolder="vae",
+                                        revision=args.revision)
     unet = UNet2DConditionModel.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="unet", revision=args.non_ema_revision
+        args.pretrained_model_name_or_path, subfolder="unet",
+        revision=args.non_ema_revision
     )
-    #########修改2###################
     unet_tea = UNet2DConditionModel.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="unet", revision=args.non_ema_revision
+        args.pretrained_model_name_or_path, subfolder="unet",
+        revision=args.non_ema_revision
     )
-    ##################################
 
     # Freeze vae and text_encoder
     vae.requires_grad_(False)
     text_encoder.requires_grad_(False)
 
-    #########修改3###################
     unet_tea.requires_grad_(False)
-    ##################################
 
     # Create EMA for the unet.
     if args.use_ema:
         ema_unet = UNet2DConditionModel.from_pretrained(
-            args.pretrained_model_name_or_path, subfolder="unet", revision=args.revision
+            args.pretrained_model_name_or_path, subfolder="unet",
+            revision=args.revision
         )
-        ema_unet = EMAModel(ema_unet.parameters(), model_cls=UNet2DConditionModel, model_config=ema_unet.config)
+        ema_unet = EMAModel(ema_unet.parameters(),
+                            model_cls=UNet2DConditionModel,
+                            model_config=ema_unet.config)
 
     if args.enable_xformers_memory_efficient_attention:
         if is_xformers_available():
@@ -456,7 +567,36 @@ def main():
                 )
             unet.enable_xformers_memory_efficient_attention()
         else:
-            raise ValueError("xformers is not available. Make sure it is installed correctly")
+            raise ValueError(
+                "xformers is not available. Make sure it is installed correctly")
+
+    def compute_snr(timesteps):
+        """
+        Computes SNR as per https://github.com/TiankaiHang/Min-SNR-Diffusion-Training/blob/521b624bd70c67cee4bdf49225915f5945a872e3/guided_diffusion/gaussian_diffusion.py#L847-L849
+        """
+        alphas_cumprod = noise_scheduler.alphas_cumprod
+        sqrt_alphas_cumprod = alphas_cumprod ** 0.5
+        sqrt_one_minus_alphas_cumprod = (1.0 - alphas_cumprod) ** 0.5
+
+        # Expand the tensors.
+        # Adapted from https://github.com/TiankaiHang/Min-SNR-Diffusion-Training/blob/521b624bd70c67cee4bdf49225915f5945a872e3/guided_diffusion/gaussian_diffusion.py#L1026
+        sqrt_alphas_cumprod = sqrt_alphas_cumprod.to(device=timesteps.device)[
+            timesteps].float()
+        while len(sqrt_alphas_cumprod.shape) < len(timesteps.shape):
+            sqrt_alphas_cumprod = sqrt_alphas_cumprod[..., None]
+        alpha = sqrt_alphas_cumprod.expand(timesteps.shape)
+
+        sqrt_one_minus_alphas_cumprod = \
+        sqrt_one_minus_alphas_cumprod.to(device=timesteps.device)[
+            timesteps].float()
+        while len(sqrt_one_minus_alphas_cumprod.shape) < len(timesteps.shape):
+            sqrt_one_minus_alphas_cumprod = sqrt_one_minus_alphas_cumprod[
+                ..., None]
+        sigma = sqrt_one_minus_alphas_cumprod.expand(timesteps.shape)
+
+        # Compute SNR.
+        snr = (alpha / sigma) ** 2
+        return snr
 
     # `accelerate` 0.16.0 will have better support for customized saving
     if version.parse(accelerate.__version__) >= version.parse("0.16.0"):
@@ -473,7 +613,8 @@ def main():
 
         def load_model_hook(models, input_dir):
             if args.use_ema:
-                load_model = EMAModel.from_pretrained(os.path.join(input_dir, "unet_ema"), UNet2DConditionModel)
+                load_model = EMAModel.from_pretrained(
+                    os.path.join(input_dir, "unet_ema"), UNet2DConditionModel)
                 ema_unet.load_state_dict(load_model.state_dict())
                 ema_unet.to(accelerator.device)
                 del load_model
@@ -483,7 +624,8 @@ def main():
                 model = models.pop()
 
                 # load diffusers style into model
-                load_model = UNet2DConditionModel.from_pretrained(input_dir, subfolder="unet")
+                load_model = UNet2DConditionModel.from_pretrained(input_dir,
+                                                                  subfolder="unet")
                 model.register_to_config(**load_model.config)
 
                 model.load_state_dict(load_model.state_dict())
@@ -502,7 +644,7 @@ def main():
 
     if args.scale_lr:
         args.learning_rate = (
-            args.learning_rate * args.gradient_accumulation_steps * args.train_batch_size * accelerator.num_processes
+                args.learning_rate * args.gradient_accumulation_steps * args.train_batch_size * accelerator.num_processes
         )
 
     # Initialize the optimizer
@@ -555,9 +697,10 @@ def main():
     column_names = dataset["train"].column_names
 
     # 6. Get the column names for input/target.
-    dataset_columns = dataset_name_mapping.get(args.dataset_name, None)
+    dataset_columns = DATASET_NAME_MAPPING.get(args.dataset_name, None)
     if args.image_column is None:
-        image_column = dataset_columns[0] if dataset_columns is not None else column_names[0]
+        image_column = dataset_columns[0] if dataset_columns is not None else \
+        column_names[0]
     else:
         image_column = args.image_column
         if image_column not in column_names:
@@ -565,7 +708,8 @@ def main():
                 f"--image_column' value '{args.image_column}' needs to be one of: {', '.join(column_names)}"
             )
     if args.caption_column is None:
-        caption_column = dataset_columns[1] if dataset_columns is not None else column_names[1]
+        caption_column = dataset_columns[1] if dataset_columns is not None else \
+        column_names[1]
     else:
         caption_column = args.caption_column
         if caption_column not in column_names:
@@ -579,32 +723,43 @@ def main():
         captions = []
         for caption in examples[caption_column]:
             if isinstance(caption, str):
+                if torch.rand(1) < args.caption_drop_prob:
+                    caption = ''
                 captions.append(caption)
             elif isinstance(caption, (list, np.ndarray)):
                 # take a random caption if there are multiple
-                captions.append(random.choice(caption) if is_train else caption[0])
+                cap = random.choice(caption) if is_train else caption[0]
+                if torch.rand(1) < args.caption_drop_prob:
+                    cap = ''
+                captions.append(cap)
             else:
                 raise ValueError(
                     f"Caption column `{caption_column}` should contain either strings or lists of strings."
                 )
         inputs = tokenizer(
-            captions, max_length=tokenizer.model_max_length, padding="max_length", truncation=True, return_tensors="pt"
+            captions, max_length=tokenizer.model_max_length,
+            padding="max_length", truncation=True, return_tensors="pt"
         )
         return inputs.input_ids
-    
+
     def tokenize_empty_text(examples):
         captions = [""] * len(examples[caption_column])
         inputs = tokenizer(
-            captions, max_length=tokenizer.model_max_length, padding="max_length", truncation=True, return_tensors="pt"
+            captions, max_length=tokenizer.model_max_length,
+            padding="max_length", truncation=True, return_tensors="pt"
         )
         return inputs.input_ids
 
     # Preprocessing the datasets.
     train_transforms = transforms.Compose(
         [
-            transforms.Resize(args.resolution, interpolation=transforms.InterpolationMode.BILINEAR),
-            transforms.CenterCrop(args.resolution) if args.center_crop else transforms.RandomCrop(args.resolution),
-            transforms.RandomHorizontalFlip() if args.random_flip else transforms.Lambda(lambda x: x),
+            transforms.Resize(args.resolution,
+                              interpolation=transforms.InterpolationMode.BILINEAR),
+            transforms.CenterCrop(
+                args.resolution) if args.center_crop else transforms.RandomCrop(
+                args.resolution),
+            transforms.RandomHorizontalFlip() if args.random_flip else transforms.Lambda(
+                lambda x: x),
             transforms.ToTensor(),
             transforms.Normalize([0.5], [0.5]),
         ]
@@ -612,25 +767,29 @@ def main():
 
     def preprocess_train(examples):
         images = [image.convert("RGB") for image in examples[image_column]]
-        examples["pixel_values"] = [train_transforms(image) for image in images]
+        examples["pixel_values"] = [train_transforms(image) for image in
+                                    images]
         examples["input_ids"] = tokenize_captions(examples)
         examples["input_ids_empty"] = tokenize_empty_text(examples)
-        # examples["caption"] = examples[caption_column]
         return examples
 
     with accelerator.main_process_first():
         if args.max_train_samples is not None:
-            dataset["train"] = dataset["train"].shuffle(seed=args.seed).select(range(args.max_train_samples))
+            dataset["train"] = dataset["train"].shuffle(seed=args.seed).select(
+                range(args.max_train_samples))
         # Set the training transforms
         train_dataset = dataset["train"].with_transform(preprocess_train)
 
     def collate_fn(examples):
-        pixel_values = torch.stack([example["pixel_values"] for example in examples])
-        pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
+        pixel_values = torch.stack(
+            [example["pixel_values"] for example in examples])
+        pixel_values = pixel_values.to(
+            memory_format=torch.contiguous_format).float()
         input_ids = torch.stack([example["input_ids"] for example in examples])
-        input_ids_empty = torch.stack([example["input_ids_empty"] for example in examples])
-        # caption = [example["caption"] for example in examples]
-        return {"pixel_values": pixel_values, "input_ids": input_ids, "input_ids_empty": input_ids_empty}
+        input_ids_empty = torch.stack(
+            [example["input_ids_empty"] for example in examples])
+        return {"pixel_values": pixel_values, "input_ids": input_ids,
+                "input_ids_empty": input_ids_empty}
 
     # DataLoaders creation:
     train_dataloader = torch.utils.data.DataLoader(
@@ -643,7 +802,8 @@ def main():
 
     # Scheduler and math around the number of training steps.
     overrode_max_train_steps = False
-    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
+    num_update_steps_per_epoch = math.ceil(
+        len(train_dataloader) / args.gradient_accumulation_steps)
     if args.max_train_steps is None:
         args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
         overrode_max_train_steps = True
@@ -675,21 +835,23 @@ def main():
     text_encoder.to(accelerator.device, dtype=weight_dtype)
     vae.to(accelerator.device, dtype=weight_dtype)
 
-    #########修改4###################
     unet_tea.to(accelerator.device, dtype=weight_dtype)
-    ################################
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
-    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
+    num_update_steps_per_epoch = math.ceil(
+        len(train_dataloader) / args.gradient_accumulation_steps)
     if overrode_max_train_steps:
         args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
     # Afterwards we recalculate our number of training epochs
-    args.num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
+    args.num_train_epochs = math.ceil(
+        args.max_train_steps / num_update_steps_per_epoch)
 
     # We need to initialize the trackers we use, and also store our configuration.
     # The trackers initializes automatically on the main process.
     if accelerator.is_main_process:
-        accelerator.init_trackers("text2image-fine-tune", config=vars(args))
+        tracker_config = dict(vars(args))
+        tracker_config.pop("validation_prompts")
+        accelerator.init_trackers(args.tracker_project_name, tracker_config)
 
     # Train!
     total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
@@ -697,10 +859,15 @@ def main():
     logger.info("***** Running training *****")
     logger.info(f"  Num examples = {len(train_dataset)}")
     logger.info(f"  Num Epochs = {args.num_train_epochs}")
-    logger.info(f"  Instantaneous batch size per device = {args.train_batch_size}")
-    logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
-    logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
+    logger.info(
+        f"  Instantaneous batch size per device = {args.train_batch_size}")
+    logger.info(
+        f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
+    logger.info(
+        f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
     logger.info(f"  Total optimization steps = {args.max_train_steps}")
+    logger.info(f"  Drop rate = {args.caption_drop_prob}")
+    logger.info(f"  Timestep_stu = {ts}, timestep_tea = {ts_tea}")
     global_step = 0
     first_epoch = 0
 
@@ -727,24 +894,24 @@ def main():
 
             resume_global_step = global_step * args.gradient_accumulation_steps
             first_epoch = global_step // num_update_steps_per_epoch
-            resume_step = resume_global_step % (num_update_steps_per_epoch * args.gradient_accumulation_steps)
+            resume_step = resume_global_step % (
+                        num_update_steps_per_epoch * args.gradient_accumulation_steps)
 
     # Only show the progress bar once on each machine.
-    progress_bar = tqdm(range(global_step, args.max_train_steps), disable=not accelerator.is_local_main_process)
+    progress_bar = tqdm(range(global_step, args.max_train_steps),
+                        disable=not accelerator.is_local_main_process)
     progress_bar.set_description("Steps")
 
-    #########修改5：先设置guidance_scale为7.5，采样guidance_scale在V4中实现###################
-    guidance_scale = 7.5
+    guidance_scale_min = 1
+    guidance_scale_max = 14
     unet_tea.eval()
-    
-    
+
     noise_scheduler.set_timesteps(ts, device=accelerator.device)
     timesteps_stu = noise_scheduler.timesteps
     noise_scheduler_tea.set_timesteps(ts_tea, device=accelerator.device)
     timesteps_tea = noise_scheduler_tea.timesteps
-    print(timesteps_stu, timesteps_tea)  # 如果ts=512，ts_tea=1024，那么timesteps_stu=[1023, 1021, 1019, ..., 1], timesteps_tea=[1023, 1022, 1021, .., 0]
-    ##############################################
-    
+    print(timesteps_stu, timesteps_tea)
+
     for epoch in range(first_epoch, args.num_train_epochs):
         unet.train()
         train_loss = 0.0
@@ -756,8 +923,11 @@ def main():
                 continue
 
             with accelerator.accumulate(unet):
+                guidance_scale = random.random() * (
+                            guidance_scale_max - guidance_scale_min) + guidance_scale_min
                 # Convert images to latent space
-                latents = vae.encode(batch["pixel_values"].to(weight_dtype)).latent_dist.sample()
+                latents = vae.encode(batch["pixel_values"].to(
+                    weight_dtype)).latent_dist.sample()
                 latents = latents * vae.config.scaling_factor
 
                 # Sample noise that we'll add to the latents
@@ -765,15 +935,18 @@ def main():
                 if args.noise_offset:
                     # https://www.crosslabs.org//blog/diffusion-with-offset-noise
                     noise += args.noise_offset * torch.randn(
-                        (latents.shape[0], latents.shape[1], 1, 1), device=latents.device
+                        (latents.shape[0], latents.shape[1], 1, 1),
+                        device=latents.device
                     )
-
-                #########修改6###################
+                if args.input_pertubation:
+                    new_noise = noise + args.input_pertubation * torch.randn_like(
+                        noise)
                 bsz = latents.shape[0]
                 # Sample a random timestep for each image
-                idx = torch.randint(0, len(timesteps_stu), (bsz,), device=latents.device)
+                idx = torch.randint(0, len(timesteps_stu), (bsz,),
+                                    device=latents.device)
                 timesteps = timesteps_stu[idx]
-                # timesteps = torch.randint(0, noise_scheduler.num_train_timesteps, (bsz,), device=latents.device)
+                # timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)
                 timesteps = timesteps.long()
 
                 timesteps_tea_1 = timesteps
@@ -781,47 +954,75 @@ def main():
 
                 # Add noise to the latents according to the noise magnitude at each timestep
                 # (this is the forward diffusion process)
-                noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
+                if args.input_pertubation:
+                    noisy_latents = noise_scheduler.add_noise(latents,
+                                                              new_noise,
+                                                              timesteps)
+                else:
+                    noisy_latents = noise_scheduler.add_noise(latents, noise,
+                                                              timesteps)
 
                 # Get the text embedding for conditioning
                 encoder_hidden_states = text_encoder(batch["input_ids"])[0]
-                encoder_hidden_states_empty_text = text_encoder(batch["input_ids_empty"])[0]
+                encoder_hidden_states_empty_text = \
+                text_encoder(batch["input_ids_empty"])[0]
 
                 latent_model_input = torch.cat([noisy_latents] * 2)
                 latent_model_input_stu = copy.deepcopy(latent_model_input)
-                prompt_embeds = torch.cat([encoder_hidden_states_empty_text, encoder_hidden_states])
+                prompt_embeds = torch.cat(
+                    [encoder_hidden_states_empty_text, encoder_hidden_states])
 
                 with torch.no_grad():
-                    model_pred_tea_1 = unet_tea(latent_model_input, torch.cat([timesteps_tea_1] * 2), prompt_embeds).sample
+                    model_pred_tea_1 = unet_tea(latent_model_input, torch.cat(
+                        [timesteps_tea_1] * 2), prompt_embeds).sample
                     # do_classifier_free_guidance
-                    pred_uncond_tea_1, pred_text_tea_1 = model_pred_tea_1.chunk(2)
-                    pred_tea_1 = pred_uncond_tea_1 + guidance_scale * (pred_text_tea_1 - pred_uncond_tea_1)
-                    noisy_latents_tea = noise_scheduler_tea.step_training(pred_tea_1, timesteps_tea_1, noisy_latents, eta=0., generator=None).prev_sample
-                    
-                    latent_model_input_1 = torch.cat([noisy_latents_tea] * 2)
-                    model_pred_tea_2 = unet_tea(latent_model_input_1, torch.cat([timesteps_tea_2] * 2), prompt_embeds).sample
-                    pred_uncond_tea_2, pred_text_tea_2 = model_pred_tea_2.chunk(2)
-                    pred_tea_2 = pred_uncond_tea_2 + guidance_scale * (pred_text_tea_2 - pred_uncond_tea_2)
-                    noisy_latents_tea = noise_scheduler_tea.step_training(pred_tea_2, timesteps_tea_2, noisy_latents_tea, eta=0., generator=None).prev_sample
-                    noisy_latents_tea = noisy_latents_tea.detach()
-                    del model_pred_tea_1, pred_uncond_tea_1, pred_text_tea_1, pred_tea_1, latent_model_input_1, model_pred_tea_2, pred_uncond_tea_2, pred_text_tea_2, pred_tea_2
+                    pred_uncond_tea_1, pred_text_tea_1 = model_pred_tea_1.chunk(
+                        2)
+                    pred_tea_1 = pred_uncond_tea_1 + guidance_scale * (
+                                pred_text_tea_1 - pred_uncond_tea_1)
+                    noisy_latents_tea = noise_scheduler_tea.step_training(
+                        pred_tea_1, timesteps_tea_1, noisy_latents, eta=0.,
+                        generator=None).prev_sample
 
-                model_pred_stu = unet(latent_model_input_stu, torch.cat([timesteps] * 2), prompt_embeds).sample
+                    latent_model_input_1 = torch.cat([noisy_latents_tea] * 2)
+                    model_pred_tea_2 = unet_tea(latent_model_input_1,
+                                                torch.cat(
+                                                    [timesteps_tea_2] * 2),
+                                                prompt_embeds).sample
+                    pred_uncond_tea_2, pred_text_tea_2 = model_pred_tea_2.chunk(
+                        2)
+                    pred_tea_2 = pred_uncond_tea_2 + guidance_scale * (
+                                pred_text_tea_2 - pred_uncond_tea_2)
+                    noisy_latents_tea = noise_scheduler_tea.step_training(
+                        pred_tea_2, timesteps_tea_2, noisy_latents_tea, eta=0.,
+                        generator=None).prev_sample
+                    noisy_latents_tea = noisy_latents_tea.detach()
+
+                model_pred_stu = unet(latent_model_input_stu,
+                                      torch.cat([timesteps] * 2),
+                                      prompt_embeds).sample
                 pred_uncond_stu, pred_text_stu = model_pred_stu.chunk(2)
-                pred_stu = pred_uncond_stu + guidance_scale * (pred_text_stu - pred_uncond_stu)
-                noisy_latents_stu = noise_scheduler.step_training(pred_stu, timesteps, noisy_latents, eta=0., generator=None).prev_sample
-                
-                ######################################
-                loss = F.mse_loss(noisy_latents_stu.float(), noisy_latents_tea.float(), reduction="mean")
+                pred_stu = pred_uncond_stu + guidance_scale * (
+                            pred_text_stu - pred_uncond_stu)
+                noisy_latents_stu = noise_scheduler.step_training(pred_stu,
+                                                                  timesteps,
+                                                                  noisy_latents,
+                                                                  eta=0.,
+                                                                  generator=None).prev_sample
+
+                loss = F.mse_loss(noisy_latents_stu.float(),
+                                  noisy_latents_tea.float(), reduction="mean")
 
                 # Gather the losses across all processes for logging (if we use distributed training).
-                avg_loss = accelerator.gather(loss.repeat(args.train_batch_size)).mean()
+                avg_loss = accelerator.gather(
+                    loss.repeat(args.train_batch_size)).mean()
                 train_loss += avg_loss.item() / args.gradient_accumulation_steps
 
                 # Backpropagate
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
-                    accelerator.clip_grad_norm_(unet.parameters(), args.max_grad_norm)
+                    accelerator.clip_grad_norm_(unet.parameters(),
+                                                args.max_grad_norm)
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad()
@@ -837,15 +1038,39 @@ def main():
 
                 if global_step % args.checkpointing_steps == 0:
                     if accelerator.is_main_process:
-                        save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
+                        save_path = os.path.join(args.output_dir,
+                                                 f"checkpoint-{global_step}")
                         accelerator.save_state(save_path)
                         logger.info(f"Saved state to {save_path}")
 
-            logs = {"step_loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
+            logs = {"step_loss": loss.detach().item(),
+                    "lr": lr_scheduler.get_last_lr()[0]}
             progress_bar.set_postfix(**logs)
 
             if global_step >= args.max_train_steps:
                 break
+
+        if accelerator.is_main_process:
+            if args.validation_prompts is not None and epoch % args.validation_epochs == 0:
+                if args.use_ema:
+                    # Store the UNet parameters temporarily and load the EMA parameters to perform inference.
+                    ema_unet.store(unet.parameters())
+                    ema_unet.copy_to(unet.parameters())
+                log_validation(
+                    vae,
+                    text_encoder,
+                    tokenizer,
+                    unet,
+                    args,
+                    accelerator,
+                    weight_dtype,
+                    global_step,
+                    num_inference_steps=ts,
+                    model_type=noise_scheduler.config['prediction_type']
+                )
+                if args.use_ema:
+                    # Switch back to the original UNet parameters.
+                    ema_unet.restore(unet.parameters())
 
     # Create the pipeline using the trained modules and save it.
     accelerator.wait_for_everyone()
@@ -864,7 +1089,12 @@ def main():
         pipeline.save_pretrained(args.output_dir)
 
         if args.push_to_hub:
-            repo.push_to_hub(commit_message="End of training", blocking=False, auto_lfs_prune=True)
+            upload_folder(
+                repo_id=repo_id,
+                folder_path=args.output_dir,
+                commit_message="End of training",
+                ignore_patterns=["step_*", "epoch_*"],
+            )
 
     accelerator.end_training()
 
